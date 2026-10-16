@@ -218,3 +218,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- anime_2d_3d ----
+# created by setup.bat: uv's Python + download cache, nunif/iw3 checkout with its models
+.uv/
+vendor/
+# videos: inputs, test clips and conversion results (temp files live in output\...\.sbs_tmp)
+to_convert/
+clips/
+output/
+.sbs_tmp/
+*.partial
+# local Claude Code settings
+.claude/settings.local.json
