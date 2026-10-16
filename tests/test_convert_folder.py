@@ -1,6 +1,5 @@
 """convert_folder.py: finding videos, skipping finished ones, remux with all tracks, timing check (no GPU)."""
 import sys
-from pathlib import Path
 
 import pytest
 

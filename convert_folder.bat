@@ -11,7 +11,7 @@ if not exist "%~dp0.venv\Scripts\python.exe" (echo Run setup.bat first. & exit /
 
 echo %IW3_EXTRA_ARGS% | findstr /c:"--compile" >nul && call :load_msvc
 
-"%~dp0.venv\Scripts\python.exe" "%~dp0convert_folder.py" %*
+"%~dp0.venv\Scripts\python.exe" "%~dp0src\convert_folder.py" %*
 exit /b %ERRORLEVEL%
 
 :load_msvc

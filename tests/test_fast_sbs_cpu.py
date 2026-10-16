@@ -91,6 +91,53 @@ def test_read_exact_reports_truncated_frame():
     proc.wait()
 
 
+@pytest.mark.parametrize("count", [1, 24, 25, 26, 50, 51, 99, 100, 101, 137])
+def test_predict_cuts_windowing_maps_every_frame_once(count):
+    # Fake TransNetV2: a frame is a "cut" when its pixels are 1. With correct windowing the
+    # predicted cut indices are exactly the marked frames, whatever the video length.
+    marked = {0, count // 2, count - 1} if count > 2 else {0}
+    frames = torch.zeros(count, 3, 27, 48)
+    for i in marked:
+        frames[i] = 1.0
+    windows = []
+
+    def model(x):
+        windows.append(x.shape[0])
+        return (x.mean(dim=(1, 2, 3)) - 0.5) * 40, None
+
+    chunks = (frames[i:i + fs.SCENE_PAD] for i in range(0, count, fs.SCENE_PAD))
+    assert fs.predict_cuts(model, chunks) == marked
+    assert set(windows) == {fs.SCENE_WINDOW}
+
+
+def test_predict_cuts_empty_video():
+    assert fs.predict_cuts(lambda x: None, iter([])) == set()
+
+
+@pytest.mark.parametrize("info, expected", [
+    ({"matrix": "bt709", "full_range": False, "primaries": None, "transfer": "unknown"},
+     "hevc_metadata=matrix_coefficients=1:video_full_range_flag=0:colour_primaries=1:transfer_characteristics=1"),
+    ({"matrix": "smpte170m", "full_range": True, "primaries": "bt470bg", "transfer": None},
+     "hevc_metadata=matrix_coefficients=6:video_full_range_flag=1:colour_primaries=5:transfer_characteristics=6"),
+    ({"matrix": "bt2020nc", "full_range": False, "primaries": "bt2020", "transfer": "smpte2084"},
+     "hevc_metadata=matrix_coefficients=9:video_full_range_flag=0:colour_primaries=9:transfer_characteristics=16"),
+    ({"matrix": "bt2020nc", "full_range": False, "primaries": None, "transfer": None},   # no guess for HDR
+     "hevc_metadata=matrix_coefficients=9:video_full_range_flag=0"),
+])
+def test_hevc_metadata_filter(info, expected):
+    assert fs.hevc_metadata_filter(info) == expected
+
+
+def test_stereo_stage_serial_runs_inline():
+    calls = []
+    stage = fs.StereoStage(lambda d, f, flush: calls.append((len(d), [i for _, i in f], flush)),
+                           torch.device("cpu"), overlapped=False)
+    stage.submit([1, 2], [(None, 0), (None, 1)])
+    stage.submit([], [], flush=True)
+    stage.close()
+    assert calls == [(2, [0, 1], False), (0, [], True)]
+
+
 @pytest.mark.parametrize("qp, expected", [(20, (20, 26, 16)), (18, (18, 24, 14)), (0, (0, 1, 0))])
 def test_nvenc_qps_match_ffmpeg(qp, expected):
     # ffmpeg hevc_nvenc -qp N: P = N, B = N * 1.25 + 1.25, I = N * 0.8 (rounded)

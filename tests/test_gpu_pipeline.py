@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-from conftest import FPS, H, ROOT, SHOT_FRAMES, TOTAL_FRAMES, W, ffprobe_json
+from conftest import FPS, H, SHOT_FRAMES, SRC, TOTAL_FRAMES, W, ffprobe_json
 
 pytestmark = pytest.mark.gpu
 
@@ -18,7 +18,7 @@ CUT = {SHOT_FRAMES - 1}     # detect_scenes returns the last frame of each shot 
 
 
 def run_fast_sbs(src, out, **env):
-    result = subprocess.run([sys.executable, str(ROOT / "fast_sbs.py"), str(src), str(out)],
+    result = subprocess.run([sys.executable, str(SRC / "fast_sbs.py"), str(src), str(out)],
                             capture_output=True, text=True, encoding="utf-8", errors="replace",
                             env={**os.environ, **env})
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
@@ -51,8 +51,35 @@ def test_scene_cut_found(scene_model, clips, clip, gpu_scale):
     import torch
     fs, model, device = scene_model
     with torch.inference_mode():
-        cuts = fs._scene_pass(model, clips[clip], fs.probe(clips[clip]), device, gpu_scale=gpu_scale)
+        frames = fs.scene_frames(clips[clip], fs.probe(clips[clip]), device, gpu_scale=gpu_scale)
+        cuts = fs.predict_cuts(model, frames)
     assert cuts == CUT
+
+
+def test_stereo_stage_overlapped_keeps_order_and_reports_errors():
+    import torch
+    import fast_sbs as fs
+    device = torch.device("cuda")
+    seen = []
+
+    def work(depths, frames, flush):
+        if frames and frames[0][1] == 99:
+            raise ValueError("bad window")
+        seen.extend(idx for _, idx in frames)
+
+    stage = fs.StereoStage(work, device, overlapped=True)
+    for start in range(0, 40, 10):
+        frames = [(torch.zeros(4, device=device), i) for i in range(start, start + 10)]
+        stage.submit([torch.zeros(1, device=device)] * 10, frames)
+    stage.submit([], [], flush=True)
+    stage.close()
+    assert seen == list(range(40))
+
+    failing = fs.StereoStage(work, device, overlapped=True)
+    failing.submit([torch.zeros(1, device=device)], [(torch.zeros(4, device=device), 99)])
+    with pytest.raises(RuntimeError, match="bad window"):
+        failing.submit([torch.zeros(1, device=device)], [(torch.zeros(4, device=device), 0)])
+        failing.close()
 
 
 def test_scene_detection_falls_back_to_cpu_downscale(clips, capsys):
@@ -103,7 +130,7 @@ def test_convert_folder_end_to_end(clips, tmp_path):
     (inp / "Show").mkdir(parents=True)
     shutil.copy(clips["hevc10"], inp / "Show" / "ep 01.mkv")
     shutil.copy(clips["h264"], inp / "clip.mp4")
-    cmd = [sys.executable, str(ROOT / "convert_folder.py"), str(inp), str(out), "--engine", "fast"]
+    cmd = [sys.executable, str(SRC / "convert_folder.py"), str(inp), str(out), "--engine", "fast"]
 
     first = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert first.returncode == 0, first.stdout[-3000:] + first.stderr[-3000:]

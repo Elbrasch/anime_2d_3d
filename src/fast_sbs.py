@@ -37,11 +37,10 @@ from collections import deque
 from fractions import Fraction
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-NUNIF_DIR = ROOT / "vendor" / "nunif"
+from settings import IW3_ARGS, NUNIF_DIR
+
 sys.path.insert(0, str(NUNIF_DIR))
 
-import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from tqdm import tqdm  # noqa: E402
@@ -174,41 +173,57 @@ def detect_scenes(src, info, device):
         model = TransNetV2().load().eval().to(device)
     try:
         try:
-            return _scene_pass(model, src, info, device, gpu_scale=True)
+            return predict_cuts(model, scene_frames(src, info, device, gpu_scale=True))
         except RuntimeError:
             # formats NVDEC cannot decode come out as CPU frames, which scale_cuda cannot take
             print("note: no GPU downscaling for this video (not decodable on NVDEC?); "
                   "scene detection uses the CPU path", flush=True)
-            return _scene_pass(model, src, info, device, gpu_scale=False)
+            return predict_cuts(model, scene_frames(src, info, device, gpu_scale=False))
     finally:
         del model
         torch.cuda.empty_cache()
 
 
-def _scene_pass(model, src, info, device, gpu_scale):
-    frames, results = [], []
-    state = {"first": True, "count": 0}
+def predict_cuts(model, chunks):
+    """TransNetV2 over a stream of frame chunks -> indices of the frames that end a shot.
 
-    def push_predict(x, pts):
-        single, _ = model(x)
-        single = torch.sigmoid(single).flatten()
-        results.append((single[SCENE_PAD:-SCENE_PAD].cpu(), pts[SCENE_PAD:-SCENE_PAD]))
-        for _ in range((SCENE_WINDOW - SCENE_PAD * 2) // SCENE_PAD):
-            frames.pop(0)
+    `chunks` yields (n, 3, 27, 48) float tensors of SCENE_PAD frames (the last may be shorter);
+    `model(x)` returns (per-frame logits, _). Windowing as nunif's shot_boundary_detection: the
+    first frame is repeated SCENE_PAD times in front, each window of SCENE_WINDOW frames keeps the
+    predictions of its middle part and advances by that much, and the last frame is repeated
+    until every real frame has been predicted.
+    """
+    window, probs = deque(), []
+    count = 0
+    last = None
 
-    def batch_callback(x, pts):
-        state["count"] += x.shape[0]
+    def push(x):
+        window.append(x)
+        if len(window) == SCENE_WINDOW // SCENE_PAD:
+            single, _ = model(torch.cat(list(window)))
+            probs.append(torch.sigmoid(single).flatten()[SCENE_PAD:-SCENE_PAD].cpu())
+            for _ in range((SCENE_WINDOW - SCENE_PAD * 2) // SCENE_PAD):
+                window.popleft()
+
+    for x in chunks:
+        if count == 0:
+            window.append(torch.cat((x[:1],) * SCENE_PAD))
+        count += x.shape[0]
         if x.shape[0] < SCENE_PAD:
-            n = SCENE_PAD - x.shape[0]
-            x = torch.cat((x,) + (x[-1:],) * n, dim=0)
-            pts = torch.cat((pts,) + (pts[-1:],) * n, dim=0)
-        if state["first"]:
-            state["first"] = False
-            frames.append((torch.cat((x[0:1],) * SCENE_PAD, dim=0), torch.cat((pts[0:1],) * SCENE_PAD, dim=0)))
-        frames.append((x, pts))
-        if len(frames) == SCENE_WINDOW // SCENE_PAD:
-            push_predict(torch.cat([f for f, _ in frames]), torch.cat([p for _, p in frames]))
+            x = torch.cat((x,) + (x[-1:],) * (SCENE_PAD - x.shape[0]))
+        push(x)
+        last = x[-1:]
+    if count == 0:
+        return set()
+    while sum(p.numel() for p in probs) < count:
+        push(torch.cat((last,) * SCENE_PAD))
+    preds = torch.cat(probs)[:count]
+    return set(torch.nonzero(preds > SCENE_THRESHOLD).flatten().tolist())
 
+
+def scene_frames(src, info, device, gpu_scale):
+    """The video as 48x27 RGB frames for TransNetV2: (n, 3, 27, 48) float tensors on `device`,
+    SCENE_PAD frames each (the last may be shorter). Raises RuntimeError if the decoder fails."""
     frame_bytes = 48 * 27 * 3
     vf = SCENE_SCALE_GPU if gpu_scale else SCENE_SCALE_CPU
     # ffmpeg's messages go to a file: they explain a failure, and a pipe could fill up and stall it
@@ -217,23 +232,18 @@ def _scene_pass(model, src, info, device, gpu_scale):
                             stdout=subprocess.PIPE, stderr=errlog, bufsize=0)
     total = int(info["duration"] * info["fps"]) or None
     pbar = tqdm(total=total, desc="scene detection", unit="f", ncols=90)
-    idx = 0
     try:
-        while True:
+        n = SCENE_PAD
+        while n == SCENE_PAD:
             chunk = bytearray(frame_bytes * SCENE_PAD)
             view = memoryview(chunk)
             n = 0
             while n < SCENE_PAD and read_exact(proc.stdout, view[n * frame_bytes:(n + 1) * frame_bytes]):
                 n += 1
-            if n == 0:
-                break
-            x = torch.frombuffer(chunk, dtype=torch.uint8)[:n * frame_bytes].to(device)
-            x = x.view(n, 27, 48, 3).permute(0, 3, 1, 2).float() / 255.0
-            batch_callback(x, torch.arange(idx, idx + n, dtype=torch.long))
-            idx += n
-            pbar.update(n)
-            if n < SCENE_PAD:
-                break
+            if n:
+                x = torch.frombuffer(chunk, dtype=torch.uint8)[:n * frame_bytes].to(device)
+                pbar.update(n)
+                yield x.view(n, 27, 48, 3).permute(0, 3, 1, 2).float() / 255.0
     finally:
         pbar.close()
         proc.stdout.close()
@@ -243,19 +253,6 @@ def _scene_pass(model, src, info, device, gpu_scale):
         errlog.close()
         if rc != 0:
             raise RuntimeError(f"scene detection decoder failed (exit code {rc}): {err[-300:]}")
-    if not frames:
-        return set()
-
-    last_x, last_pts = frames[-1][0][-1:], frames[-1][1][-1:]
-    pad_x, pad_pts = torch.cat((last_x,) * SCENE_PAD), torch.cat((last_pts,) * SCENE_PAD)
-    while not results or results[-1][1][-1] != last_pts[0]:
-        frames.append((pad_x, pad_pts))
-        if len(frames) == SCENE_WINDOW // SCENE_PAD:
-            push_predict(torch.cat([f for f, _ in frames]), torch.cat([p for _, p in frames]))
-
-    preds = torch.cat([p for p, _ in results])[:state["count"]]
-    pts = torch.cat([t for _, t in results])[:state["count"]]
-    return set(pts[preds > SCENE_THRESHOLD].tolist())
 
 
 # ---------------------------------------------------------------- colour conversion on the GPU
@@ -322,7 +319,6 @@ def load_iw3(model, batch_size, extra_args):
     os.chdir(NUNIF_DIR)    # iw3 resolves some resources relative to its checkout
     from iw3 import utils as IU
     from iw3 import models  # noqa: F401  (registers the stereo models)
-    from convert_folder import IW3_ARGS
 
     stereo_args = [a for a in IW3_ARGS if a != "--yes"]
     args = IU.create_parser().parse_args(
@@ -353,50 +349,62 @@ def nvenc_qps(qp):
     return qp, int(qp * 1.25 + 1.25 + 0.5), int(qp * 0.8 + 0.5)
 
 
-class Encoder:
-    """GPU P010 frames -> NVENC straight from VRAM (PyNvVideoCodec) -> PyAV Matroska muxer.
+def hevc_metadata_filter(info):
+    """hevc_metadata bitstream filter that writes the source's colour description into the VUI
+    (NVENC writes none). Unknown primaries/transfer of BT.709 and BT.601 video get the matrix's
+    standard ones, as players assume anyway."""
+    standard = info["matrix"] if info["matrix"] in ("bt709", "smpte170m") else None
+    prim = info["primaries"] if info["primaries"] not in (None, "unknown") else standard
+    trc = info["transfer"] if info["transfer"] not in (None, "unknown") else standard
+    vui = [f"matrix_coefficients={H273_MATRIX[info['matrix']]}",
+           f"video_full_range_flag={int(info['full_range'])}"]
+    if prim in H273_PRIMARIES:
+        vui.append(f"colour_primaries={H273_PRIMARIES[prim]}")
+    if trc in H273_TRANSFER:
+        vui.append(f"transfer_characteristics={H273_TRANSFER[trc]}")
+    return "hevc_metadata=" + ":".join(vui)
 
-    The frames never leave the GPU; only the compressed HEVC stream (a few MB/s) reaches the CPU.
-    Piping raw 7680x2160 frames into an ffmpeg process instead cost several CPU cores at 4K.
-    Encoder settings match the earlier ffmpeg hevc_nvenc command: constant QP with ffmpeg's I/B
-    offsets, preset, high quality tuning, 3 B-frames, GOP 250, Main 10.
+
+class Encoder:
+    """SBS frames (float RGB on the GPU) -> P010 -> NVENC straight from VRAM -> Matroska file.
+
+        enc = Encoder(out_path, info, qp, preset)
+        enc.put(rgb)          # any thread; blocks while ENC_QUEUE frames wait for NVENC
+        enc.close()           # finishes the file; raises if encoding failed or no frame came
+
+    NVENC (PyNvVideoCodec) starts with the first frame, whose size sets the output size. The
+    frames never leave the GPU; only the compressed HEVC stream (a few MB/s) reaches the CPU, where
+    PyAV writes it. (Piping raw 7680x2160 frames into an ffmpeg process cost several CPU cores.)
+    Settings match the earlier ffmpeg hevc_nvenc command: constant QP with ffmpeg's I/B offsets,
+    preset, high quality tuning, 3 B-frames, GOP 250, Main 10, source colour description.
     """
 
-    def __init__(self, out_path, width, height, info, qp, preset):
-        import PyNvVideoCodec as nvc
-
-        fps = info["fps"]
+    def __init__(self, out_path, info, qp, preset):
+        self.out_path, self.info, self.qp, self.preset = out_path, info, qp, preset
+        self.kr, self.kb = MATRICES[info["matrix"]]
+        self.vui_filter = hevc_metadata_filter(info)
+        self.time_base = Fraction(info["fps"].denominator, info["fps"].numerator)
         self.stream_cuda = torch.cuda.Stream()
-        self.enc = nvc.CreateEncoder(
-            width, height, "P010", False, codec="hevc", preset=preset.upper(),
-            tuning_info="high_quality", rc="constqp", constqp=",".join(map(str, nvenc_qps(qp))),
-            bf=ENC_BFRAMES, gop=ENC_GOP, fps=max(1, round(float(fps))),
-            cudastream=self.stream_cuda.cuda_stream)
-        self.shape = (height * 3 // 2, width)   # P010 as one (Y rows + UV rows) x width uint16 image
-
-        prim = info["primaries"] if info["primaries"] not in (None, "unknown") else \
-            ("bt709" if info["matrix"] == "bt709" else "smpte170m" if info["matrix"] == "smpte170m" else None)
-        trc = info["transfer"] if info["transfer"] not in (None, "unknown") else \
-            ("bt709" if info["matrix"] == "bt709" else "smpte170m" if info["matrix"] == "smpte170m" else None)
-        # NVENC writes no colour description into the bitstream; hevc_metadata adds it to the VUI
-        vui = [f"matrix_coefficients={H273_MATRIX[info['matrix']]}",
-               f"video_full_range_flag={int(info['full_range'])}"]
-        if prim in H273_PRIMARIES:
-            vui.append(f"colour_primaries={H273_PRIMARIES[prim]}")
-        if trc in H273_TRANSFER:
-            vui.append(f"transfer_characteristics={H273_TRANSFER[trc]}")
-        self.vui_filter = "hevc_metadata=" + ":".join(vui)
-        self.out_path = out_path
-        self.bsf = self.container = self.stream = None    # set up from the first packet
-        self.time_base = Fraction(fps.denominator, fps.numerator)
-        self.pic_params = nvc.NV_ENC_PIC_PARAMS
-        self.frames_in = 0
+        self.enc = None                                     # NVENC, created by the first put()
+        self.bsf = self.container = self.stream = None      # set up from the first packet
+        self.frames = 0                                     # frames put
+        self.frames_in = 0                                  # frames handed to NVENC
         self.packets_out = 0
 
         self.todo = queue.Queue(maxsize=ENC_QUEUE)
         self.error = None
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
+
+    def _start(self, width, height):
+        import PyNvVideoCodec as nvc
+        self.enc = nvc.CreateEncoder(
+            width, height, "P010", False, codec="hevc", preset=self.preset.upper(),
+            tuning_info="high_quality", rc="constqp", constqp=",".join(map(str, nvenc_qps(self.qp))),
+            bf=ENC_BFRAMES, gop=ENC_GOP, fps=max(1, round(float(self.info["fps"]))),
+            cudastream=self.stream_cuda.cuda_stream)
+        self.shape = (height * 3 // 2, width)   # P010 as one (Y rows + UV rows) x width uint16 image
+        self.pic_params = nvc.NV_ENC_PIC_PARAMS
 
     @staticmethod
     def _parse(data):
@@ -451,7 +459,8 @@ class Encoder:
                 self.frames_in += 1
                 self._mux(self.enc.Encode(frame.view(torch.uint16).view(self.shape), params))
                 del frame, item
-            self._mux(self.enc.EndEncode())
+            if self.enc is not None:
+                self._mux(self.enc.EndEncode())
             if self.bsf is not None:
                 for out in self.bsf.filter(None):
                     self._write(out)
@@ -466,9 +475,13 @@ class Encoder:
                 except queue.Empty:
                     break
 
-    def put(self, p010_gpu):
+    def put(self, rgb):
         if self.error is not None:
             raise RuntimeError(f"encoder failed: {self.error!r}")
+        if self.enc is None:
+            self._start(rgb.shape[2], rgb.shape[1])
+        p010_gpu = rgb_to_p010(rgb, self.kr, self.kb, self.info["full_range"])
+        self.frames += 1
         # the encoder reads the frame on its own stream: keep its memory reserved until then
         p010_gpu.record_stream(self.stream_cuda)
         event = torch.cuda.Event()
@@ -487,6 +500,8 @@ class Encoder:
         self.thread.join()
         if self.error is not None:
             raise RuntimeError(f"encoder failed: {self.error!r}") from self.error
+        if self.frames == 0:
+            raise RuntimeError("no frames to encode")
 
     def kill(self):
         # the output is discarded after a failure; let the worker finish what it has, if it can
@@ -555,6 +570,95 @@ class Decoder:
         self.proc.kill()
 
 
+class StereoStage:
+    """Runs `work(depths, frames, flush)` for each window of frames whose depth is ready.
+
+        stage = StereoStage(work, device, overlapped)
+        stage.submit(depths, frames)       # frames: (raw YUV tensor, frame index) pairs
+        stage.submit([], [], flush=True)   # last call
+        stage.close()                      # waits for the work; raises if it failed
+
+    Serial: `work` runs inline. Overlapped: it runs on a worker thread with its own CUDA stream,
+    so the GPU warps one window while the depth model computes the next. Only STEREO_JOBS windows
+    are handed over at a time (each keeps its frames in VRAM until warped); submit() waits for a
+    free slot. Both give byte-identical output. A failure in the worker surfaces in the next
+    submit() or in close().
+    """
+
+    def __init__(self, work, device, overlapped):
+        self.work = work
+        self.error = None
+        self.stream = torch.cuda.Stream(device) if overlapped else None
+        if overlapped:
+            self.jobs = queue.Queue()
+            self.slots = threading.Semaphore(STEREO_JOBS)
+            self.thread = threading.Thread(target=self._worker, daemon=True)
+            self.thread.start()
+
+    def submit(self, depths, frames, flush=False):
+        if self.stream is None:
+            self.work(depths, frames, flush)
+            return
+        if not depths and not flush:
+            return
+        # tensors made on the main stream and used on the stereo stream: keep their memory
+        # reserved until the stereo stream is done with them
+        for d in depths:
+            d.record_stream(self.stream)
+        for x, _ in frames:
+            x.record_stream(self.stream)
+        ready = torch.cuda.Event()
+        ready.record()
+        while not self.slots.acquire(timeout=0.5):
+            self._raise_worker_error()
+        self._raise_worker_error()
+        self.jobs.put((depths, frames, flush, ready))
+
+    def close(self):
+        if self.stream is None:
+            return
+        self._raise_worker_error()
+        self.jobs.put(None)
+        self.thread.join()
+        self._raise_worker_error()
+
+    def _raise_worker_error(self):
+        if self.error is not None:
+            raise RuntimeError(f"stereo worker failed: {self.error!r}") from self.error
+
+    def _worker(self):
+        try:
+            with torch.inference_mode(), torch.cuda.stream(self.stream):
+                while (job := self.jobs.get()) is not None:
+                    depths, frames, flush, ready = job
+                    self.stream.wait_event(ready)
+                    self.work(depths, frames, flush)
+                    del depths, frames, job        # free the window's VRAM before the next one
+                    self.slots.release()
+        except BaseException as e:  # noqa: BLE001  (re-raised in the main thread)
+            self.error = e
+
+
+def compile_models(args, IU, depth_model, side_model, device):
+    """--compile (e.g. via IW3_EXTRA_ARGS), applied the way iw3's process_video_full does it.
+
+    Returns (context to keep open while converting, side model to use)."""
+    ctx = contextlib.ExitStack()
+    if not args.compile:
+        return ctx, side_model
+    from nunif.models import compile_model
+    from nunif.models.utils import check_compile_support
+    if not check_compile_support(device):
+        print("warning: --compile requested but torch.compile does not work here "
+              "(on Windows it needs the triton-windows package); running uncompiled", flush=True)
+        return ctx, side_model
+    if side_model is not None and not hasattr(side_model, "compile_context"):
+        side_model = compile_model(side_model)
+    ctx.enter_context(depth_model.compile_context(enabled=True))
+    ctx.enter_context(IU.try_compile_context(side_model, enabled=True))
+    return ctx, side_model
+
+
 @torch.inference_mode()
 def convert(src, out_path, model="VDA_S", batch_size=2, qp=20, preset="p5", extra_args=()):
     src = Path(src).resolve()
@@ -577,155 +681,79 @@ def convert(src, out_path, model="VDA_S", batch_size=2, qp=20, preset="p5", extr
     if args.ema_normalize and args.max_fps >= 15:
         depth_model.enable_ema(decay=args.ema_decay, buffer_size=args.ema_buffer)
 
-    # --compile (e.g. via IW3_EXTRA_ARGS), applied the way iw3's process_video_full does it
-    compile_ctx = contextlib.ExitStack()
-    if args.compile:
-        from nunif.models import compile_model
-        from nunif.models.utils import check_compile_support
-        if not check_compile_support(device):
-            print("warning: --compile requested but torch.compile does not work here "
-                  "(on Windows it needs the triton-windows package); running uncompiled", flush=True)
-        else:
-            if side_model is not None and not hasattr(side_model, "compile_context"):
-                side_model = compile_model(side_model)
-            compile_ctx.enter_context(depth_model.compile_context(enabled=True))
-            compile_ctx.enter_context(IU.try_compile_context(side_model, enabled=True))
+    compile_ctx, side_model = compile_models(args, IU, depth_model, side_model, device)
 
-    decoder = Decoder(src, info, device)
-    # Frames waiting for their depth stay in the decoder's YUV 4:2:0 form (P010: 3 bytes per
-    # pixel, half of RGB fp16) and are converted to RGB again for the warp; VDA keeps up to a
-    # 32-frame window of them, which at 4K is the largest block of VRAM.
-    src_queue = deque()        # (raw YUV frame on GPU, frame index) waiting for their depth
-    batch, batch_raw, batch_pts = [], [], []
     total = int(info["duration"] * info["fps"]) or None
     pbar = tqdm(total=total, desc=src.name[:40], unit="f", ncols=100)
-    out = {"encoder": None, "frames": 0, "error": None}
-
-    def emit(sbs):
-        if out["encoder"] is None:
-            out["encoder"] = Encoder(out_path, sbs.shape[2], sbs.shape[1], info, qp, preset)
-        out["encoder"].put(rgb_to_p010(sbs, kr, kb, info["full_range"]))
-        out["frames"] += 1
-        pbar.update(1)
+    encoder = Encoder(out_path, info, qp, preset)
 
     def to_rgb(raw):
         return yuv_to_rgb(raw, w, h, info["ten_bit"], kr, kb, info["full_range"])
 
-    def stereo_work(depth_list, items, flush):
+    def emit(left, right):
+        encoder.put(IU.postprocess_image(left, right, args))
+        pbar.update(1)
+
+    def warp(depths, frames, flush):
         """Stereo warp + SBS assembly + encode for frames whose depth is ready."""
-        for i in range(0, len(depth_list), args.batch_size):
-            depths = torch.stack(depth_list[i:i + args.batch_size])
-            chunk = items[i:i + args.batch_size]
-            reset_pts = [pts in segment_pts for _, pts in chunk]
+        for i in range(0, len(depths), args.batch_size):
+            batch = frames[i:i + args.batch_size]
+            reset_pts = [idx in segment_pts for _, idx in batch]
             # .half() as when the queue held fp16 RGB, so the output stays the same
-            x_srcs = torch.stack([to_rgb(raw).half() for raw, _ in chunk]).float()
-            left, right = IU.apply_divergence(depths, x_srcs, args, side_model, reset_pts=reset_pts)
+            x_srcs = torch.stack([to_rgb(raw).half() for raw, _ in batch]).float()
+            left, right = IU.apply_divergence(torch.stack(depths[i:i + args.batch_size]), x_srcs, args,
+                                              side_model, reset_pts=reset_pts)
             if left is not None:
-                for j in range(left.shape[0]):
-                    emit(IU.postprocess_image(left[j], right[j], args))
+                for le, re in zip(left, right):
+                    emit(le, re)
         if flush and hasattr(side_model, "flush"):
             left, right = side_model.flush(enable_amp=enable_amp)
             if left is not None:
                 for le, re in zip(left, right):
-                    emit(IU.postprocess_image(le, re, args))
+                    emit(le, re)
 
-    # The stereo stage runs on its own CUDA stream in a worker thread, so the GPU can warp one
-    # window's frames while the depth model computes the next window (FAST_SBS_STREAMS=0: serial).
-    # Only STEREO_JOBS windows are handed over at a time: each holds its frames in VRAM until
-    # warped, and the main thread waits for a free slot instead of queueing more.
-    use_streams = os.environ.get("FAST_SBS_STREAMS", "1") != "0"
-    work_q = queue.Queue()
-    job_slots = threading.Semaphore(STEREO_JOBS)
-    stereo_stream = torch.cuda.Stream(device) if use_streams else None
+    stereo = StereoStage(warp, device, overlapped=os.environ.get("FAST_SBS_STREAMS", "1") != "0")
+    decoder = Decoder(src, info, device)
+    # Frames waiting for their depth stay in the decoder's YUV 4:2:0 form (P010: 3 bytes per
+    # pixel, half of RGB fp16) and are converted to RGB again for the warp; VDA keeps up to a
+    # 32-frame window of them, which at 4K is the largest block of VRAM.
+    waiting = deque()          # (raw YUV frame on GPU, frame index) waiting for their depth
 
-    def stereo_worker():
-        try:
-            with torch.inference_mode(), torch.cuda.stream(stereo_stream):
-                while True:
-                    job = work_q.get()
-                    if job is None:
-                        return
-                    depth_list, items, flush, ready = job
-                    stereo_stream.wait_event(ready)
-                    stereo_work(depth_list, items, flush)
-                    del depth_list, items, job
-                    job_slots.release()
-        except BaseException as e:  # noqa: BLE001  (re-raised by the main thread)
-            out["error"] = e
+    def depth(rgbs, idxs):
+        """Depth for one batch; VDA returns the depths of earlier frames once its window allows."""
+        return depth_model.infer_with_normalize(torch.stack(rgbs), idxs, segment_pts, enable_amp=enable_amp,
+                                                edge_dilation=args.edge_dilation, depth_aa=args.depth_aa)
 
-    def submit(job):
-        while job is not None and not job_slots.acquire(timeout=0.5):
-            if out["error"] is not None:
-                raise RuntimeError(f"stereo worker failed: {out['error']!r}") from out["error"]
-        if out["error"] is not None:
-            raise RuntimeError(f"stereo worker failed: {out['error']!r}") from out["error"]
-        work_q.put(job)
-
-    worker = threading.Thread(target=stereo_worker, daemon=True) if use_streams else None
-    if worker is not None:
-        worker.start()
-
-    def stereo(depth_list, flush=False):
-        items = [src_queue.popleft() for _ in range(len(depth_list))]
-        if worker is None:
-            stereo_work(depth_list, items, flush)
-            return
-        if not depth_list and not flush:
-            return
-        # tensors made on the main stream and used on the stereo stream: keep their memory
-        # reserved until the stereo stream is done with them
-        for d in depth_list:
-            d.record_stream(stereo_stream)
-        for x, _ in items:
-            x.record_stream(stereo_stream)
-        ready = torch.cuda.Event()
-        ready.record()
-        submit((depth_list, items, flush, ready))
-
-    def infer():
-        x = torch.stack(batch)
-        for raw, pts in zip(batch_raw, batch_pts):
-            src_queue.append((raw, pts))
-        depth_list = depth_model.infer_with_normalize(
-            x, batch_pts, segment_pts, enable_amp=enable_amp,
-            edge_dilation=args.edge_dilation, depth_aa=args.depth_aa)
-        batch.clear()
-        batch_raw.clear()
-        batch_pts.clear()
-        stereo(depth_list)
+    def to_stereo(depths, flush=False):
+        stereo.submit(depths, [waiting.popleft() for _ in depths], flush)
 
     ok = False
     try:
+        rgbs, idxs = [], []
         for idx, raw in enumerate(decoder):
-            batch.append(to_rgb(raw))
-            batch_raw.append(raw)
-            batch_pts.append(idx)
-            if len(batch) == args.batch_size:
-                infer()
-        if batch:
-            infer()
-        stereo(depth_model.flush_with_normalize(enable_amp=enable_amp, edge_dilation=args.edge_dilation,
-                                                depth_aa=args.depth_aa), flush=True)
-        if worker is not None:
-            submit(None)
-            worker.join()
-            if out["error"] is not None:
-                raise RuntimeError(f"stereo worker failed: {out['error']!r}") from out["error"]
+            waiting.append((raw, idx))
+            rgbs.append(to_rgb(raw))
+            idxs.append(idx)
+            if len(rgbs) == args.batch_size:
+                to_stereo(depth(rgbs, idxs))
+                rgbs, idxs = [], []
+        if rgbs:
+            to_stereo(depth(rgbs, idxs))
+        to_stereo(depth_model.flush_with_normalize(enable_amp=enable_amp, edge_dilation=args.edge_dilation,
+                                                   depth_aa=args.depth_aa), flush=True)
+        stereo.close()
         decoder.close()
-        if out["encoder"] is None:
-            raise RuntimeError("no frames decoded")
-        out["encoder"].close()
+        encoder.close()
         ok = True
     finally:
         pbar.close()
         compile_ctx.close()
         if not ok:
             decoder.kill()
-            if out["encoder"] is not None:
-                out["encoder"].kill()
+            encoder.kill()
 
     elapsed = time.time() - t0
-    frames_out = out["frames"]
+    frames_out = encoder.frames
     peak = torch.cuda.max_memory_allocated(device) / 2**30
     print(f"{frames_out} frames in {elapsed:.1f} s ({frames_out / max(elapsed - t_scene, 1e-6):.1f} fps "
           f"after {t_scene:.1f} s scene detection), peak torch VRAM {peak:.1f} GB")

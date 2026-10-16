@@ -18,33 +18,17 @@ import argparse
 import json
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-NUNIF_DIR = ROOT / "vendor" / "nunif"
+from settings import IW3_ARGS, NUNIF_DIR
+
+SRC_DIR = Path(__file__).resolve().parent
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm", ".ts", ".m2ts", ".wmv", ".mpg", ".mpeg"}
 SUFFIX = "_LRF_Full_SBS"
 TMP_DIR_NAME = ".sbs_tmp"
-
-# Stereo settings (1080p source -> 3840x1080 Full SBS):
-#   row_flow_v3, divergence 2 / convergence 0.5   iw3 defaults for the stereo warp
-#   synthetic-view both                          spreads warp artifacts over both eyes
-#   edge-dilation 2                              fewer halos around people, less edge accuracy
-#   ema-normalize + scene-detect                 steadier depth scale, reset at cuts
-#   max-fps 128                                  keep the source frame rate (iw3 caps at 30 by default)
-#   hevc_nvenc 10-bit, qp 20                     fast GPU encode, small banding
-IW3_ARGS = [
-    "--method", "row_flow_v3", "--divergence", "2.0", "--convergence", "0.5",
-    "--synthetic-view", "both", "--edge-dilation", "2",
-    "--ema-normalize", "--ema-decay", "0.9", "--scene-detect",
-    "--max-fps", "128",
-    "--video-codec", "hevc_nvenc", "--preset", "p5", "--crf", "20", "--pix-fmt", "yuv420p10le",
-    "--yes",
-]
 
 
 def ffprobe(path, *args):
@@ -92,7 +76,7 @@ def run_iw3(src, dst, model):
 
 def run_fast(src, dst, model):
     """fast_sbs.py: same stereo settings, NVDEC decode and NVENC encode in their own processes."""
-    subprocess.run([sys.executable, str(ROOT / "fast_sbs.py"), str(src), str(dst), "--model", model],
+    subprocess.run([sys.executable, str(SRC_DIR / "fast_sbs.py"), str(src), str(dst), "--model", model],
                    check=True)
 
 

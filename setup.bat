@@ -2,7 +2,7 @@
 rem One-time setup (safe to re-run):
 rem   - Python 3.12 + all libraries into .venv with uv, as listed in pyproject.toml / uv.lock
 rem   - nunif (iw3) into vendor\nunif, at the commit this code was tested with
-rem   - every model a conversion uses (download_models.py): VDA_S, warp, scene detection
+rem   - every model a conversion uses (src\download_models.py): VDA_S, warp, scene detection
 rem   - optionally VDA_L, after asking you to accept its CC-BY-NC-4.0 license (get_vda_l.bat)
 rem Usage: setup.bat [--compile]     --compile also installs triton-windows for torch.compile
 setlocal
@@ -31,7 +31,7 @@ git -C vendor\nunif fetch --quiet origin || echo warning: could not fetch nunif,
 git -C vendor\nunif -c advice.detachedHead=false checkout --quiet %NUNIF_COMMIT% || exit /b 1
 
 set "PY=%~dp0.venv\Scripts\python.exe"
-"%PY%" "%~dp0download_models.py" || exit /b 1
+"%PY%" "%~dp0src\download_models.py" || exit /b 1
 
 echo.
 echo Optional: Video Depth Anything Large (better depth, about half the speed, non-commercial license).

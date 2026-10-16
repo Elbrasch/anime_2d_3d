@@ -14,9 +14,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-SRC_DIR = ROOT / "to_convert"
-CLIP_DIR = ROOT / "clips"
+from settings import PROJECT_DIR
+
+SRC_DIR = PROJECT_DIR / "to_convert"
+CLIP_DIR = PROJECT_DIR / "clips"
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm", ".ts", ".wmv"}
 
 

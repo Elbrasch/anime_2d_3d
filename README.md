@@ -85,7 +85,7 @@ The setup takes a while and downloads about 4 GB. It:
 - installs Python 3.12 and all libraries into `.venv` from `pyproject.toml` / `uv.lock`
   (uv's Python and download cache go to `.uv\`),
 - clones nunif (iw3) into `vendor\nunif` at the commit this code was tested with,
-- downloads every model a conversion uses (`download_models.py`): Video Depth Anything Small, the
+- downloads every model a conversion uses (`src\download_models.py`): Video Depth Anything Small, the
   stereo warp model and the scene detection model,
 - offers to download **Video Depth Anything Large** (~1.5 GB, better depth at about half the
   speed). Its weights are licensed **CC-BY-NC-4.0 (non-commercial only)**: type `YES` to accept,
@@ -115,7 +115,7 @@ cd E:\anime_2d_3d
 
 With the larger model: `.\convert_folder.bat "D:\Anime" "E:\Anime 3D VDA_L" --model VDA_L`.
 A single video file also works as input. All options:
-`.venv\Scripts\python.exe convert_folder.py -h`.
+`.venv\Scripts\python.exe src\convert_folder.py -h`.
 
 Shortcuts for quick tests:
 
@@ -134,7 +134,7 @@ Shortcuts for quick tests:
 
 ### Stereo settings
 
-Set in `IW3_ARGS` in `convert_folder.py` (used by both engines): `row_flow_v3` warp, divergence 2,
+Set in `IW3_ARGS` in `src/settings.py` (used by both engines): `row_flow_v3` warp, divergence 2,
 convergence 0.5, synthetic view on both eyes, edge dilation 2 (fewer halos around moving objects),
 EMA depth normalisation reset at scene cuts, source frame rate kept, HEVC Main 10 at constant QP 20.
 
@@ -183,6 +183,19 @@ Measured on an RTX 4070 SUPER with VDA_S:
 
 The output matches iw3's own (PSNR ~49 dB, the difference being encoder rounding).
 
+### Project layout
+
+| Path | Contents |
+|---|---|
+| `*.bat` | the scripts you run: setup, conversion, test clips, VDA_L download |
+| `src/convert_folder.py` | folder walk, skip logic, remux with all tracks, timing check |
+| `src/fast_sbs.py` | one video: scene detection, `Decoder` (ffmpeg NVDEC), depth, `StereoStage` (serial or overlapped warp), `Encoder` (NVENC + Matroska) |
+| `src/settings.py` | project paths and the stereo settings (`IW3_ARGS`) shared by both engines |
+| `src/download_models.py` | model prefetch used by `setup.bat` |
+| `src/extract_clip.py` | cuts test clips |
+| `tests/` | pytest suite (see below) |
+| `vendor/`, `.venv/`, `.uv/` | created by `setup.bat`, not in git |
+
 ## Tests
 
 ```powershell
@@ -195,12 +208,14 @@ subtitles, chapters) with ffmpeg, so no test footage is stored in the repository
 
 - **CPU tests** (`tests/test_convert_folder.py`, `tests/test_fast_sbs_cpu.py`): folder mirroring
   and skipping, the remux keeping every track, the timing check, colour conversion round trips
-  and P010 bit layout, probing, the decoder pipe, the encoder's QP settings.
+  and P010 bit layout, probing, the decoder pipe, the encoder's QP and colour settings, and the
+  TransNetV2 windowing (with a fake model, for many video lengths).
 - **GPU tests** (`tests/test_gpu_pipeline.py`, marker `gpu`, skipped without CUDA or models):
   the scene cut is found at the right frame with GPU and CPU downscaling, the output is HEVC
   Main 10 with bt709 tags, correct timestamps and every frame, serial and overlapped stereo give a
-  byte-identical video, a source NVDEC cannot decode still converts, and `convert_folder.py` end
-  to end (including the skip on a second run).
+  byte-identical video, the overlapped stage keeps frame order and reports worker errors, a source
+  NVDEC cannot decode still converts, and `convert_folder.py` end to end (including the skip on a
+  second run).
 
 Speed is not tested automatically; it depends on the machine.
 

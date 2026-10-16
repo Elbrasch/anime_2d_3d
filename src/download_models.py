@@ -11,10 +11,9 @@ downloaded here; get_vda_l.bat asks for the license first.
 """
 import os
 import sys
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-NUNIF_DIR = ROOT / "vendor" / "nunif"
+from settings import IW3_ARGS, NUNIF_DIR
+
 sys.path.insert(0, str(NUNIF_DIR))
 
 
@@ -25,7 +24,6 @@ def main():
     from iw3.hub_dir import HUB_MODEL_DIR
     from iw3.stereo_model_factory import create_stereo_model
     from iw3.video_depth_anything_model import VideoDepthAnythingModel
-    from convert_folder import IW3_ARGS
 
     print("Video Depth Anything code (torch hub)", flush=True)
     VideoDepthAnythingModel.force_update()
